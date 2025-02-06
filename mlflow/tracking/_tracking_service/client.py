@@ -7,9 +7,10 @@ exposed in the :py:mod:`mlflow.tracking` module.
 import json
 import logging
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
-from typing import Dict, List, Optional
+from typing import Optional
 
 from mlflow.entities import (
     ExperimentTag,
@@ -39,16 +40,19 @@ from mlflow.store.tracking import (
     SEARCH_MAX_RESULTS_DEFAULT,
     SEARCH_TRACES_DEFAULT_MAX_RESULTS,
 )
-from mlflow.tracing.constant import TRACE_SCHEMA_VERSION, TRACE_SCHEMA_VERSION_KEY
+from mlflow.store.tracking.rest_store import RestStore
+from mlflow.tracing.artifact_utils import get_artifact_uri_for_trace
+from mlflow.tracing.constant import TraceMetadataKey
 from mlflow.tracing.utils import TraceJSONEncoder, exclude_immutable_tags
 from mlflow.tracking._tracking_service import utils
 from mlflow.tracking.metric_value_conversion_utils import convert_metric_value_to_float_if_possible
 from mlflow.utils import chunk_list
 from mlflow.utils.async_logging.run_operations import RunOperations, get_combined_run_operations
-from mlflow.utils.mlflow_tags import IMMUTABLE_TAGS, MLFLOW_ARTIFACT_LOCATION, MLFLOW_USER
+from mlflow.utils.databricks_utils import get_workspace_url, is_in_databricks_notebook
+from mlflow.utils.mlflow_tags import IMMUTABLE_TAGS, MLFLOW_USER
 from mlflow.utils.string_utils import is_string_type
 from mlflow.utils.time import get_current_time_millis
-from mlflow.utils.uri import add_databricks_profile_info_to_artifact_uri
+from mlflow.utils.uri import add_databricks_profile_info_to_artifact_uri, is_databricks_uri
 from mlflow.utils.validation import (
     MAX_ENTITIES_PER_BATCH,
     MAX_METRICS_PER_BATCH,
@@ -174,8 +178,8 @@ class TrackingServiceClient:
         self,
         experiment_id: str,
         timestamp_ms: int,
-        request_metadata: Dict[str, str],
-        tags: Dict[str, str],
+        request_metadata: dict[str, str],
+        tags: dict[str, str],
     ):
         """
         Start an initial TraceInfo object in the backend store.
@@ -190,7 +194,6 @@ class TrackingServiceClient:
             The created TraceInfo object.
         """
         tags = exclude_immutable_tags(tags or {})
-        tags.update({TRACE_SCHEMA_VERSION_KEY: str(TRACE_SCHEMA_VERSION)})
         return self.store.start_trace(
             experiment_id=experiment_id,
             timestamp_ms=timestamp_ms,
@@ -203,8 +206,8 @@ class TrackingServiceClient:
         request_id: str,
         timestamp_ms: int,
         status: TraceStatus,
-        request_metadata: Dict[str, str],
-        tags: Dict[str, str],
+        request_metadata: dict[str, str],
+        tags: dict[str, str],
     ) -> TraceInfo:
         """
         Update the TraceInfo object in the backend store with the completed trace info.
@@ -236,7 +239,7 @@ class TrackingServiceClient:
         experiment_id: str,
         max_timestamp_millis: Optional[int] = None,
         max_traces: Optional[int] = None,
-        request_ids: Optional[List[str]] = None,
+        request_ids: Optional[list[str]] = None,
     ) -> int:
         return self.store.delete_traces(
             experiment_id=experiment_id,
@@ -290,10 +293,10 @@ class TrackingServiceClient:
 
     def _search_traces(
         self,
-        experiment_ids: List[str],
+        experiment_ids: list[str],
         filter_string: Optional[str] = None,
         max_results: int = SEARCH_TRACES_DEFAULT_MAX_RESULTS,
-        order_by: Optional[List[str]] = None,
+        order_by: Optional[list[str]] = None,
         page_token: Optional[str] = None,
     ):
         return self.store.search_traces(
@@ -306,11 +309,12 @@ class TrackingServiceClient:
 
     def search_traces(
         self,
-        experiment_ids: List[str],
+        experiment_ids: list[str],
         filter_string: Optional[str] = None,
         max_results: int = SEARCH_TRACES_DEFAULT_MAX_RESULTS,
-        order_by: Optional[List[str]] = None,
+        order_by: Optional[list[str]] = None,
         page_token: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> PagedList[Trace]:
         def download_trace_data(trace_info: TraceInfo) -> Optional[Trace]:
             """
@@ -320,14 +324,31 @@ class TrackingServiceClient:
             try:
                 trace_data = self._download_trace_data(trace_info)
             except MlflowTraceDataException as e:
-                _logger.debug(
-                    f"Failed to download trace data for trace with {e.ctx}",
-                    trace_info.request_id,
-                    exc_info=True,
+                _logger.warning(
+                    (
+                        f"Failed to download trace data for trace {trace_info.request_id!r} "
+                        f"with {e.ctx}. For full traceback, set logging level to DEBUG."
+                    ),
+                    exc_info=_logger.isEnabledFor(logging.DEBUG),
                 )
                 return None
             else:
                 return Trace(trace_info, trace_data)
+
+        # If run_id is provided, add it to the filter string
+        if run_id:
+            additional_filter = f"metadata.{TraceMetadataKey.SOURCE_RUN} = '{run_id}'"
+            if filter_string:
+                if TraceMetadataKey.SOURCE_RUN in filter_string:
+                    raise MlflowException(
+                        "You cannot filter by run_id when it is already part of the filter string."
+                        f"Please remove the {TraceMetadataKey.SOURCE_RUN} filter from the filter "
+                        "string and try again.",
+                        error_code=INVALID_PARAMETER_VALUE,
+                    )
+                filter_string += f" AND {additional_filter}"
+            else:
+                filter_string = additional_filter
 
         traces = []
         next_max_results = max_results
@@ -495,7 +516,6 @@ class TrackingServiceClient:
 
         """
         _validate_experiment_artifact_location(artifact_location)
-
         return self.store.create_experiment(
             name=name,
             artifact_location=artifact_location,
@@ -525,6 +545,7 @@ class TrackingServiceClient:
 
         Args:
             experiment_id: The experiment ID returned from ``create_experiment``.
+            new_name: New name for the experiment.
 
         """
         self.store.rename_experiment(experiment_id, new_name)
@@ -694,6 +715,16 @@ class TrackingServiceClient:
         if len(metrics) == 0 and len(params) == 0 and len(tags) == 0:
             return
 
+        metrics = [
+            Metric(
+                metric.key,
+                convert_metric_value_to_float_if_possible(metric.value),
+                metric.timestamp,
+                metric.step,
+            )
+            for metric in metrics
+        ]
+
         param_batches = chunk_list(params, MAX_PARAMS_TAGS_PER_BATCH)
         tag_batches = chunk_list(tags, MAX_PARAMS_TAGS_PER_BATCH)
 
@@ -740,11 +771,11 @@ class TrackingServiceClient:
             # Merge all the run operations into a single run operations object
             return get_combined_run_operations(run_operations_list)
 
-    def log_inputs(self, run_id: str, datasets: Optional[List[DatasetInput]] = None):
+    def log_inputs(self, run_id: str, datasets: Optional[list[DatasetInput]] = None):
         """Log one or more dataset inputs to a run.
 
         Args:
-            run_id: String ID of the run
+            run_id: String ID of the run.
             datasets: List of :py:class:`mlflow.entities.DatasetInput` instances to log.
 
         Raises:
@@ -769,12 +800,7 @@ class TrackingServiceClient:
         self.store.record_logged_model(run_id, mlflow_model)
 
     def _get_artifact_repo_for_trace(self, trace_info: TraceInfo):
-        if MLFLOW_ARTIFACT_LOCATION not in trace_info.tags:
-            raise MlflowException(
-                "Trace artifact location not specified, please specify it with "
-                f"tag '{MLFLOW_ARTIFACT_LOCATION}' in the trace."
-            )
-        artifact_uri = trace_info.tags[MLFLOW_ARTIFACT_LOCATION]
+        artifact_uri = get_artifact_uri_for_trace(trace_info)
         artifact_uri = add_databricks_profile_info_to_artifact_uri(artifact_uri, self.tracking_uri)
         return get_artifact_repository(artifact_uri)
 
@@ -801,6 +827,7 @@ class TrackingServiceClient:
         Write a local file or directory to the remote ``artifact_uri``.
 
         Args:
+            run_id: String ID of the run.
             local_path: Path to the file or directory to write.
             artifact_path: If provided, the directory in ``artifact_uri`` to write to.
         """
@@ -820,7 +847,7 @@ class TrackingServiceClient:
 
     def _upload_trace_data(self, trace_info: TraceInfo, trace_data: TraceData) -> None:
         artifact_repo = self._get_artifact_repo_for_trace(trace_info)
-        trace_data_json = json.dumps(trace_data.to_dict(), cls=TraceJSONEncoder)
+        trace_data_json = json.dumps(trace_data.to_dict(), cls=TraceJSONEncoder, ensure_ascii=False)
         return artifact_repo.upload_trace_data(trace_data_json)
 
     def _log_artifact_async(self, run_id, filename, artifact_path=None, artifact=None):
@@ -828,6 +855,7 @@ class TrackingServiceClient:
         Write an artifact to the remote ``artifact_uri`` asynchronously.
 
         Args:
+            run_id: String ID of the run.
             filename: Filename of the artifact to be logged.
             artifact_path: If provided, the directory in ``artifact_uri`` to write to.
             artifact: The artifact to be logged.
@@ -839,6 +867,7 @@ class TrackingServiceClient:
         """Write a directory of files to the remote ``artifact_uri``.
 
         Args:
+            run_id: String ID of the run.
             local_dir: Path to the directory of files to write.
             artifact_path: If provided, the directory in ``artifact_uri`` to write to.
 
@@ -878,15 +907,42 @@ class TrackingServiceClient:
         """
         return self._get_artifact_repo(run_id).download_artifacts(path, dst_path)
 
+    def _log_url(self, run_id):
+        if not isinstance(self.store, RestStore):
+            return
+        if is_in_databricks_notebook():
+            # In Databricks notebooks, MLflow experiment and run links are displayed automatically.
+            return
+        host_url = get_workspace_url()
+        if host_url is None:
+            host_url = self.store.get_host_creds().host.rstrip("/")
+        run_info = self.store.get_run(run_id).info
+        experiment_id = run_info.experiment_id
+        run_name = run_info.run_name
+        if is_databricks_uri(self.tracking_uri):
+            experiment_url = f"{host_url}/ml/experiments/{experiment_id}"
+        else:
+            experiment_url = f"{host_url}/#/experiments/{experiment_id}"
+        run_url = f"{experiment_url}/runs/{run_id}"
+
+        sys.stdout.write(f"🏃 View run {run_name} at: {run_url}\n")
+        sys.stdout.write(f"🧪 View experiment at: {experiment_url}\n")
+
     def set_terminated(self, run_id, status=None, end_time=None):
         """Set a run's status to terminated.
 
         Args:
+            run_id: String ID of the run.
             status: A string value of :py:class:`mlflow.entities.RunStatus`. Defaults to "FINISHED".
             end_time: If not provided, defaults to the current time.
         """
         end_time = end_time if end_time else get_current_time_millis()
         status = status if status else RunStatus.to_string(RunStatus.FINISHED)
+        # Tell the store to stop async logging: stop accepting new data and log already enqueued
+        # data in the background. This call is making sure every async logging data has been
+        # submitted for logging, but not necessarily finished logging.
+        self.store.shut_down_async_logging()
+        self._log_url(run_id)
         self.store.update_run_info(
             run_id,
             run_status=RunStatus.from_string(status),

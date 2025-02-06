@@ -4,11 +4,10 @@ import os
 import pathlib
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 import pydantic
 import yaml
-from packaging import version
 from packaging.version import Version
 from pydantic import ConfigDict, Field, ValidationError, root_validator, validator
 from pydantic.json import pydantic_encoder
@@ -27,10 +26,12 @@ from mlflow.gateway.utils import (
     is_valid_endpoint_name,
     is_valid_mosiacml_chat_model,
 )
+from mlflow.utils import IS_PYDANTIC_V2_OR_NEWER
 
 _logger = logging.getLogger(__name__)
 
-IS_PYDANTIC_V2 = version.parse(pydantic.version.VERSION) >= version.parse("2.0")
+if IS_PYDANTIC_V2_OR_NEWER:
+    from pydantic import SerializeAsAny
 
 
 class Provider(str, Enum):
@@ -124,7 +125,7 @@ class OpenAIConfig(ConfigModel):
         return _resolve_api_key_from_input(value)
 
     @classmethod
-    def _validate_field_compatibility(cls, info: Dict[str, Any]):
+    def _validate_field_compatibility(cls, info: dict[str, Any]):
         if not isinstance(info, dict):
             return info
         api_type = (info.get("openai_api_type") or OpenAIAPIType.OPENAI).lower()
@@ -157,18 +158,18 @@ class OpenAIConfig(ConfigModel):
 
         return info
 
-    if IS_PYDANTIC_V2:
+    if IS_PYDANTIC_V2_OR_NEWER:
         from pydantic import model_validator as _model_validator
 
         @_model_validator(mode="before")
-        def validate_field_compatibility(cls, info: Dict[str, Any]):
+        def validate_field_compatibility(cls, info: dict[str, Any]):
             return cls._validate_field_compatibility(info)
 
     else:
         from pydantic import root_validator as _root_validator
 
         @_root_validator(pre=False)
-        def validate_field_compatibility(cls, config: Dict[str, Any]):
+        def validate_field_compatibility(cls, config: dict[str, Any]):
             return cls._validate_field_compatibility(config)
 
 
@@ -229,22 +230,6 @@ class MistralConfig(ConfigModel):
         return _resolve_api_key_from_input(value)
 
 
-config_types = {
-    Provider.COHERE: CohereConfig,
-    Provider.OPENAI: OpenAIConfig,
-    Provider.ANTHROPIC: AnthropicConfig,
-    Provider.AI21LABS: AI21LabsConfig,
-    Provider.MOSAICML: MosaicMLConfig,
-    Provider.BEDROCK: AmazonBedrockConfig,
-    Provider.AMAZON_BEDROCK: AmazonBedrockConfig,
-    Provider.MLFLOW_MODEL_SERVING: MlflowModelServingConfig,
-    Provider.PALM: PaLMConfig,
-    Provider.HUGGINGFACE_TEXT_GENERATION_INFERENCE: HuggingFaceTextGenerationInferenceConfig,
-    Provider.MISTRAL: MistralConfig,
-    Provider.TOGETHERAI: TogetherAIConfig,
-}
-
-
 class ModelInfo(ResponseModel):
     name: Optional[str] = None
     provider: Provider
@@ -279,8 +264,13 @@ def _resolve_api_key_from_input(api_key_input):
 
     # try reading from a local path
     file = pathlib.Path(api_key_input)
-    if file.is_file():
-        return file.read_text()
+    try:
+        if file.is_file():
+            return file.read_text()
+    except OSError:
+        # `is_file` throws an OSError if `api_key_input` exceeds the maximum filename length
+        # (e.g., 255 characters on Unix).
+        pass
 
     # if the key itself is passed, return
     return api_key_input
@@ -289,42 +279,37 @@ def _resolve_api_key_from_input(api_key_input):
 class Model(ConfigModel):
     name: Optional[str] = None
     provider: Union[str, Provider]
-    config: Optional[
-        Union[
-            CohereConfig,
-            OpenAIConfig,
-            AI21LabsConfig,
-            AnthropicConfig,
-            AmazonBedrockConfig,
-            MosaicMLConfig,
-            MlflowModelServingConfig,
-            HuggingFaceTextGenerationInferenceConfig,
-            PaLMConfig,
-            MistralConfig,
-            TogetherAIConfig,
-        ]
-    ] = None
+    if IS_PYDANTIC_V2_OR_NEWER:
+        config: Optional[SerializeAsAny[ConfigModel]] = None
+    else:
+        config: Optional[ConfigModel] = None
 
     @validator("provider", pre=True)
     def validate_provider(cls, value):
+        from mlflow.gateway.provider_registry import provider_registry
+
         if isinstance(value, Provider):
             return value
         formatted_value = value.replace("-", "_").upper()
         if formatted_value in Provider.__members__:
             return Provider[formatted_value]
+        if value in provider_registry.keys():
+            return value
         raise MlflowException.invalid_parameter_value(f"The provider '{value}' is not supported.")
 
     @classmethod
     def _validate_config(cls, info, values):
+        from mlflow.gateway.provider_registry import provider_registry
+
         if provider := values.get("provider"):
-            config_type = config_types[provider]
+            config_type = provider_registry.get(provider).CONFIG_TYPE
             return config_type(**info)
 
         raise MlflowException.invalid_parameter_value(
             "A provider must be provided for each gateway route."
         )
 
-    if IS_PYDANTIC_V2:
+    if IS_PYDANTIC_V2_OR_NEWER:
 
         @validator("config", pre=True)
         def validate_config(cls, info, values):
@@ -357,7 +342,7 @@ class Limit(LimitModel):
 
 
 class LimitsConfig(ConfigModel):
-    limits: Optional[List[Limit]] = []
+    limits: Optional[list[Limit]] = []
 
 
 class RouteConfig(AliasedConfigModel):
@@ -457,7 +442,7 @@ _ROUTE_EXTRA_SCHEMA = {
         "name": "openai-completions",
         "route_type": "llm/v1/completions",
         "model": {
-            "name": "gpt-3.5-turbo",
+            "name": "gpt-4o-mini",
             "provider": "openai",
         },
         "route_url": "/gateway/routes/completions/invocations",
@@ -473,7 +458,7 @@ class Route(ConfigModel):
     limit: Optional[Limit] = None
 
     class Config:
-        if IS_PYDANTIC_V2:
+        if IS_PYDANTIC_V2_OR_NEWER:
             json_schema_extra = _ROUTE_EXTRA_SCHEMA
         else:
             schema_extra = _ROUTE_EXTRA_SCHEMA
@@ -491,7 +476,7 @@ class Route(ConfigModel):
 
 
 class GatewayConfig(AliasedConfigModel):
-    routes: List[RouteConfig] = Field(alias="endpoints")
+    routes: list[RouteConfig] = Field(alias="endpoints")
 
 
 def _load_route_config(path: Union[str, Path]) -> GatewayConfig:

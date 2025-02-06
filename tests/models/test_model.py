@@ -6,6 +6,7 @@ from unittest import mock
 
 import numpy as np
 import pandas as pd
+import pydantic
 import pytest
 import sklearn.datasets
 import sklearn.neighbors
@@ -13,10 +14,11 @@ from packaging.version import Version
 from scipy.sparse import csc_matrix
 
 import mlflow
+from mlflow.exceptions import MlflowException
 from mlflow.models import Model, ModelSignature, infer_signature, set_model, validate_schema
-from mlflow.models.model import METADATA_FILES
+from mlflow.models.model import METADATA_FILES, SET_MODEL_ERROR
 from mlflow.models.resources import DatabricksServingEndpoint, DatabricksVectorSearchIndex
-from mlflow.models.utils import _save_example
+from mlflow.models.utils import _read_example, _save_example
 from mlflow.store.artifact.s3_artifact_repo import S3ArtifactRepository
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.types.schema import ColSpec, DataType, ParamSchema, ParamSpec, Schema, TensorSpec
@@ -161,16 +163,27 @@ def test_model_log():
             "flavor2": {"x": 1, "y": 2},
         }
         assert loaded_model.signature == sig
-        path = os.path.join(local_path, loaded_model.saved_input_example_info["artifact_path"])
-        x = dataframe_from_raw_json(path)
-        assert x.to_dict(orient="records")[0] == input_example
+        x = _read_example(
+            Model(saved_input_example_info=loaded_model.saved_input_example_info), local_path
+        )
+        assert x == input_example
         assert not hasattr(loaded_model, "databricks_runtime")
 
         loaded_example = loaded_model.load_input_example(local_path)
-        assert isinstance(loaded_example, pd.DataFrame)
-        assert loaded_example.to_dict(orient="records")[0] == input_example
+        assert loaded_example == input_example
 
         assert Version(loaded_model.mlflow_version) == Version(mlflow.version.VERSION)
+
+
+def test_model_log_calls_maybe_render_agent_eval_recipe(tmp_path):
+    sig = ModelSignature(
+        inputs=Schema([ColSpec("integer", "x"), ColSpec("integer", "y")]),
+        outputs=Schema([ColSpec(name=None, type="double")]),
+    )
+    input_example = {"x": 1, "y": 2}
+    with mock.patch("mlflow.models.display_utils.maybe_render_agent_eval_recipe") as render_mock:
+        _log_model_with_signature_and_example(tmp_path, sig, input_example)
+        render_mock.assert_called_once()
 
 
 def test_model_info():
@@ -215,9 +228,10 @@ def test_model_info():
             "flavor2": {"x": 1, "y": 2},
         }
 
-        path = os.path.join(local_path, model_info.saved_input_example_info["artifact_path"])
-        x = dataframe_from_raw_json(path)
-        assert x.to_dict(orient="records")[0] == input_example
+        x = _read_example(
+            Model(saved_input_example_info=model_info.saved_input_example_info), local_path
+        )
+        assert x == input_example
 
         model_signature = model_info_fetched.signature
         assert model_info.signature_dict == sig.to_dict()
@@ -225,6 +239,17 @@ def test_model_info():
 
         assert model_info.mlflow_version == loaded_model.mlflow_version
         assert model_info_fetched.mlflow_version == loaded_model.mlflow_version
+
+
+def test_model_info_with_model_version(tmp_path):
+    experiment_id = mlflow.create_experiment("test", artifact_location=str(tmp_path))
+    with mlflow.start_run(experiment_id=experiment_id):
+        model_info = Model.log("some/path", TestFlavor, registered_model_name="model_abc")
+        assert model_info.registered_model_version == 1
+        model_info = Model.log("some/path", TestFlavor, registered_model_name="model_abc")
+        assert model_info.registered_model_version == 2
+        model_info = Model.log("some/path", TestFlavor)
+        assert model_info.registered_model_version is None
 
 
 def test_model_metadata():
@@ -248,8 +273,9 @@ def test_load_model_without_mlflow_version():
 
 def test_model_log_with_databricks_runtime():
     dbr_version = "8.3.x"
-    with TempDir(chdr=True) as tmp, mock.patch(
-        "mlflow.models.model.get_databricks_runtime_version", return_value=dbr_version
+    with (
+        TempDir(chdr=True) as tmp,
+        mock.patch("mlflow.models.model.get_databricks_runtime_version", return_value=dbr_version),
     ):
         sig = ModelSignature(
             inputs=Schema([ColSpec("integer", "x"), ColSpec("integer", "y")]),
@@ -266,9 +292,10 @@ def test_model_log_with_databricks_runtime():
             "flavor2": {"x": 1, "y": 2},
         }
         assert loaded_model.signature == sig
-        path = os.path.join(local_path, loaded_model.saved_input_example_info["artifact_path"])
-        x = dataframe_from_raw_json(path)
-        assert x.to_dict(orient="records")[0] == input_example
+        x = _read_example(
+            Model(saved_input_example_info=loaded_model.saved_input_example_info), local_path
+        )
+        assert x == input_example
         assert loaded_model.databricks_runtime == dbr_version
 
 
@@ -304,6 +331,8 @@ def test_model_log_with_input_example_succeeds():
 
         # date column will get deserialized into string
         input_example["d"] = input_example["d"].apply(lambda x: x.isoformat())
+        # datetime Datatype numpy type is [ns]
+        input_example["e"] = input_example["e"].astype(np.dtype("datetime64[ns]"))
         pd.testing.assert_frame_equal(x, input_example)
 
         loaded_example = loaded_model.load_input_example(local_path)
@@ -347,6 +376,8 @@ def test_model_input_example_with_params_log_load_succeeds(tmp_path):
     pdf["d"] = pdf["d"].apply(lambda x: x.isoformat())
     loaded_example = loaded_model.load_input_example(local_path)
     assert isinstance(loaded_example, pd.DataFrame)
+    # datetime Datatype numpy type is [ns]
+    pdf["e"] = pdf["e"].astype(np.dtype("datetime64[ns]"))
     pd.testing.assert_frame_equal(loaded_example, pdf)
 
     params = loaded_model.load_input_example_params(local_path)
@@ -398,12 +429,12 @@ def test_model_load_input_example_failures():
         loaded_example = loaded_model.load_input_example(local_path)
         assert loaded_example is not None
 
-        with pytest.raises(FileNotFoundError, match="No such file or directory"):
+        with pytest.raises(MlflowException, match="No such file or directory"):
             loaded_model.load_input_example(os.path.join(local_path, "folder_which_does_not_exist"))
 
         path = os.path.join(local_path, loaded_model.saved_input_example_info["artifact_path"])
         os.remove(path)
-        with pytest.raises(FileNotFoundError, match="No such file or directory"):
+        with pytest.raises(MlflowException, match="No such file or directory"):
             loaded_model.load_input_example(local_path)
 
 
@@ -476,10 +507,9 @@ def test_save_load_input_example_without_conversion(tmp_path):
     }
     with mlflow.start_run() as run:
         mlflow.pyfunc.log_model(
+            "test_model",
             python_model=MyModel(),
-            artifact_path="test_model",
             input_example=input_example,
-            example_no_conversion=True,
         )
         local_path = _download_artifact_from_uri(
             f"runs:/{run.info.run_id}/test_model", output_path=tmp_path
@@ -490,6 +520,28 @@ def test_save_load_input_example_without_conversion(tmp_path):
     assert loaded_example == input_example
 
 
+def test_save_load_input_example_with_pydantic_model(tmp_path):
+    class Message(pydantic.BaseModel):
+        role: str
+        content: str
+
+    class MyModel(mlflow.pyfunc.PythonModel):
+        def predict(self, context, model_input: list[Message], params=None):
+            return model_input
+
+    with mlflow.start_run():
+        model_info = mlflow.pyfunc.log_model(
+            "test_model",
+            python_model=MyModel(),
+            input_example=[Message(role="user", content="Hello!")],
+        )
+    local_path = _download_artifact_from_uri(model_info.model_uri, output_path=tmp_path)
+    loaded_model = Model.load(os.path.join(local_path, "MLmodel"))
+    assert loaded_model.saved_input_example_info["type"] == "json_object"
+    loaded_example = loaded_model.load_input_example(local_path)
+    assert loaded_example == [{"role": "user", "content": "Hello!"}]
+
+
 def test_model_saved_by_save_model_can_be_loaded(tmp_path, sklearn_knn_model):
     mlflow.sklearn.save_model(sklearn_knn_model, tmp_path)
     info = Model.load(tmp_path).get_model_info()
@@ -497,11 +549,18 @@ def test_model_saved_by_save_model_can_be_loaded(tmp_path, sklearn_knn_model):
     assert info.artifact_path is None
 
 
-def test_copy_metadata(sklearn_knn_model):
+def test_copy_metadata(mock_is_in_databricks, sklearn_knn_model):
     with mlflow.start_run():
         model_info = mlflow.sklearn.log_model(sklearn_knn_model, "model")
-        artifact_path = mlflow.artifacts.download_artifacts(model_info.model_uri)
-        assert set(os.listdir(os.path.join(artifact_path, "metadata"))) == set(METADATA_FILES)
+
+    artifact_path = mlflow.artifacts.download_artifacts(model_info.model_uri)
+    metadata_path = os.path.join(artifact_path, "metadata")
+    # Metadata should be copied only in Databricks
+    if mock_is_in_databricks.return_value:
+        assert set(os.listdir(metadata_path)) == set(METADATA_FILES)
+    else:
+        assert not os.path.exists(metadata_path)
+    mock_is_in_databricks.assert_called_once()
 
 
 class LegacyTestFlavor:
@@ -513,11 +572,18 @@ class LegacyTestFlavor:
         mlflow_model.save(os.path.join(path, "MLmodel"))
 
 
-def test_legacy_flavor():
+def test_legacy_flavor(mock_is_in_databricks):
     with mlflow.start_run():
         model_info = Model.log("some/path", LegacyTestFlavor)
+
     artifact_path = _download_artifact_from_uri(model_info.model_uri)
-    assert set(os.listdir(os.path.join(artifact_path, "metadata"))) == {"MLmodel"}
+    metadata_path = os.path.join(artifact_path, "metadata")
+    # Metadata should be copied only in Databricks
+    if mock_is_in_databricks.return_value:
+        assert set(os.listdir(metadata_path)) == {"MLmodel"}
+    else:
+        assert not os.path.exists(metadata_path)
+    mock_is_in_databricks.assert_called_once()
 
 
 def test_pyfunc_set_model():
@@ -549,10 +615,7 @@ def test_langchain_set_model():
 
 
 def test_error_set_model(sklearn_knn_model):
-    with pytest.raises(
-        mlflow.MlflowException,
-        match="Model should either be an instance of PyFuncModel or Langchain type.",
-    ):
+    with pytest.raises(mlflow.MlflowException, match=SET_MODEL_ERROR):
         set_model(sklearn_knn_model)
 
 

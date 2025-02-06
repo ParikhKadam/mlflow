@@ -2,7 +2,8 @@ import time
 from threading import Thread
 from typing import Optional
 
-from mlflow.entities import LiveSpan, Trace
+from mlflow.entities import LiveSpan, Span, Trace
+from mlflow.entities.span_status import SpanStatusCode
 from mlflow.tracing.trace_manager import InMemoryTraceManager
 
 from tests.tracing.helper import create_mock_otel_span, create_test_trace_info
@@ -57,6 +58,10 @@ def test_add_spans():
     assert len(trace.data.spans) == 3
     assert request_id_1 not in trace_manager._traces
 
+    # The popped trace should only contain non-live (immutable) spans
+    assert isinstance(trace.data.spans[0], Span)
+    assert not isinstance(trace.data.spans[0], LiveSpan)
+
     trace = trace_manager.pop_trace(trace_id_2)
     assert isinstance(trace, Trace)
     assert trace.info.request_id == request_id_2
@@ -98,8 +103,6 @@ def test_add_and_pop_span_thread_safety():
 
 
 def test_traces_buffer_expires_after_ttl(monkeypatch):
-    # Clear singleton instance to patch TTL
-    InMemoryTraceManager._instance = None
     monkeypatch.setenv("MLFLOW_TRACE_BUFFER_TTL_SECONDS", "1")
 
     trace_manager = InMemoryTraceManager.get_instance()
@@ -120,9 +123,32 @@ def test_traces_buffer_expires_after_ttl(monkeypatch):
     InMemoryTraceManager._instance = None
 
 
+def test_traces_buffer_expires_and_log_when_timeout_is_set(monkeypatch):
+    # Setting MLFLOW_TRACE_TIMEOUT_SECONDS let MLflow to periodically check the
+    # expired traces and log expired ones to the backend.
+    monkeypatch.setenv("MLFLOW_TRACE_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("MLFLOW_TRACE_TTL_CHECK_INTERVAL_SECONDS", "1")
+
+    trace_manager = InMemoryTraceManager.get_instance()
+    request_id_1 = "tr-1"
+    trace_info = create_test_trace_info(request_id_1, "test")
+    trace_manager.register_trace(12345, trace_info)
+
+    span_1_1 = _create_test_span(request_id_1)
+    trace_manager.register_span(span_1_1)
+
+    assert trace_manager._traces.get(request_id_1) is not None
+    assert len(trace_manager._traces[request_id_1].span_dict) == 1
+
+    assert request_id_1 in trace_manager._traces
+
+    time.sleep(3)
+
+    assert request_id_1 not in trace_manager._traces
+    assert span_1_1.status.status_code == SpanStatusCode.ERROR
+
+
 def test_traces_buffer_max_size_limit(monkeypatch):
-    # Clear singleton instance to patch buffer size
-    InMemoryTraceManager._instance = None
     monkeypatch.setenv("MLFLOW_TRACE_BUFFER_MAX_SIZE", "1")
 
     trace_manager = InMemoryTraceManager.get_instance()

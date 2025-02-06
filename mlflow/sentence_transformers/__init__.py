@@ -2,7 +2,7 @@ import json
 import logging
 import pathlib
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -70,7 +70,7 @@ _logger = logging.getLogger(__name__)
 
 
 @experimental
-def get_default_pip_requirements() -> List[str]:
+def get_default_pip_requirements() -> list[str]:
     """
     Retrieves the set of minimal dependencies for the ``sentence_transformers`` flavor.
 
@@ -96,8 +96,8 @@ def get_default_conda_env():
 
 @experimental
 def _verify_task_and_update_metadata(
-    task: str, metadata: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+    task: str, metadata: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
     if task not in [_LLM_INFERENCE_TASK_EMBEDDING]:
         raise MlflowException.invalid_parameter_value(
             f"Received invalid parameter value for `task` argument {task}. Task type could "
@@ -121,15 +121,16 @@ def save_model(
     model,
     path: str,
     task: Optional[str] = None,
-    inference_config: Optional[Dict[str, Any]] = None,
-    code_paths: Optional[List[str]] = None,
+    inference_config: Optional[dict[str, Any]] = None,
+    code_paths: Optional[list[str]] = None,
     mlflow_model: Optional[Model] = None,
     signature: Optional[ModelSignature] = None,
     input_example: Optional[ModelInputExample] = None,
-    pip_requirements: Optional[Union[List[str], str]] = None,
-    extra_pip_requirements: Optional[Union[List[str], str]] = None,
+    pip_requirements: Optional[Union[list[str], str]] = None,
+    extra_pip_requirements: Optional[Union[list[str], str]] = None,
     conda_env=None,
-    metadata: Optional[Dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    example_no_conversion: Optional[bool] = None,
 ) -> None:
     """
     .. note::
@@ -169,6 +170,7 @@ def save_model(
         extra_pip_requirements: {{ extra_pip_requirements }}
         conda_env: {{ conda_env }}
         metadata: {{ metadata }}
+        example_no_conversion: {{ example_no_conversion }}
     """
     import sentence_transformers
 
@@ -181,24 +183,26 @@ def save_model(
 
     code_dir_subpath = _validate_and_copy_code_paths(code_paths, str(path))
 
+    if mlflow_model is None:
+        mlflow_model = Model()
+    saved_example = _save_example(
+        mlflow_model, input_example, path, no_conversion=example_no_conversion
+    )
+
     if task is not None:
         signature = ModelSignature(
             inputs=EMBEDDING_MODEL_INPUT_SCHEMA, outputs=EMBEDDING_MODEL_OUTPUT_SCHEMA
         )
-    elif signature is None and input_example is not None:
+    elif signature is None and saved_example is not None:
         wrapped_model = _SentenceTransformerModelWrapper(model)
-        signature = _infer_signature_from_input_example(input_example, wrapped_model)
+        signature = _infer_signature_from_input_example(saved_example, wrapped_model)
     elif signature is None:
         signature = _get_default_signature()
     elif signature is False:
         signature = None
 
-    if mlflow_model is None:
-        mlflow_model = Model()
     if signature is not None:
         mlflow_model.signature = signature
-    if input_example is not None:
-        _save_example(mlflow_model, input_example, str(path))
     if metadata is not None:
         mlflow_model.metadata = metadata
     model_config = None
@@ -255,7 +259,7 @@ def save_model(
     _PythonEnv.current().to_yaml(str(path.joinpath(_PYTHON_ENV_FILE_NAME)))
 
 
-def _get_transformers_model_metadata(model) -> Dict[str, str]:
+def _get_transformers_model_metadata(model) -> dict[str, str]:
     """
     Extract metadata about the underlying Transformers model, such as the model class name
     and the repository id.
@@ -302,16 +306,17 @@ def log_model(
     model,
     artifact_path: str,
     task: Optional[str] = None,
-    inference_config: Optional[Dict[str, Any]] = None,
-    code_paths: Optional[List[str]] = None,
+    inference_config: Optional[dict[str, Any]] = None,
+    code_paths: Optional[list[str]] = None,
     registered_model_name: Optional[str] = None,
     signature: Optional[ModelSignature] = None,
     input_example: Optional[ModelInputExample] = None,
     await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS,
-    pip_requirements: Optional[Union[List[str], str]] = None,
-    extra_pip_requirements: Optional[Union[List[str], str]] = None,
+    pip_requirements: Optional[Union[list[str], str]] = None,
+    extra_pip_requirements: Optional[Union[list[str], str]] = None,
     conda_env=None,
-    metadata: Optional[Dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    example_no_conversion: Optional[bool] = None,
 ):
     """
     .. note::
@@ -372,10 +377,14 @@ def log_model(
             call :py:func:`infer_signature() <mlflow.models.infer_signature>` on datasets
             with valid model inputs and valid model outputs.
         input_example: {{ input_example }}
+        await_registration_for: Number of seconds to wait for the model version to finish
+            being created and is in ``READY`` status. By default, the function
+            waits for five minutes. Specify 0 or None to skip waiting.
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
         conda_env: {{ conda_env }}
         metadata: {{ metadata }}
+        example_no_conversion: {{ example_no_conversion }}
     """
     if task is not None:
         metadata = _verify_task_and_update_metadata(task, metadata)
@@ -394,10 +403,25 @@ def log_model(
         input_example=input_example,
         pip_requirements=pip_requirements,
         extra_pip_requirements=extra_pip_requirements,
+        example_no_conversion=example_no_conversion,
     )
 
 
-def _load_pyfunc(path, model_config: Optional[Dict[str, Any]] = None):
+def _get_load_kwargs():
+    import sentence_transformers
+
+    load_kwargs = {}
+    # The trust_remote_code is supported since Sentence Transformers 2.3.0
+    if Version(sentence_transformers.__version__) >= Version("2.3.0"):
+        # Always set trust_remote_code=True because we save the entire repository files in
+        # the model artifacts, so there is no risk of running untrusted code unless the logged
+        # artifact is modified by a malicious actor, which is much more broader security
+        # concern that even cannot be prevented by setting trust_remote_code=False.
+        load_kwargs["trust_remote_code"] = True
+    return load_kwargs
+
+
+def _load_pyfunc(path, model_config: Optional[dict[str, Any]] = None):  # noqa: D417
     """
     Load PyFunc implementation for SentenceTransformer. Called by ``pyfunc.load_model``.
 
@@ -406,7 +430,8 @@ def _load_pyfunc(path, model_config: Optional[Dict[str, Any]] = None):
     """
     import sentence_transformers
 
-    model = sentence_transformers.SentenceTransformer.load(path)
+    load_kwargs = _get_load_kwargs()
+    model = sentence_transformers.SentenceTransformer(path, **load_kwargs)
     model_config = model_config or {}
     task = model_config.get("task", None)
     return _SentenceTransformerModelWrapper(model, task)
@@ -450,14 +475,7 @@ def load_model(model_uri: str, dst_path: Optional[str] = None):
 
     _add_code_from_conf_to_system_path(local_model_path, flavor_config)
 
-    load_kwargs = {}
-    # The trust_remote_code is supported since Sentence Transformers 2.3.0
-    if Version(sentence_transformers.__version__) >= Version("2.3.0"):
-        # Always set trust_remote_code=True because we save the entire repository files in
-        # the model artifacts, so there is no risk of running untrusted code unless the logged
-        # artifact is modified by a malicious actor, which is much more broader security
-        # concern that even cannot be prevented by setting trust_remote_code=False.
-        load_kwargs["trust_remote_code"] = True
+    load_kwargs = _get_load_kwargs()
     return sentence_transformers.SentenceTransformer(str(local_model_dir), **load_kwargs)
 
 
@@ -477,7 +495,13 @@ class _SentenceTransformerModelWrapper:
         self.model = model
         self.task = task
 
-    def predict(self, sentences, params: Optional[Dict[str, Any]] = None):
+    def get_raw_model(self):
+        """
+        Returns the underlying model.
+        """
+        return self.model
+
+    def predict(self, sentences, params: Optional[dict[str, Any]] = None):
         """
         Args:
             sentences: Model input data.

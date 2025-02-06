@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass, field
-from typing import Dict, Optional
+from typing import Optional
 
 from mlflow.entities._mlflow_object import _MlflowObject
 from mlflow.entities.trace_status import TraceStatus
@@ -18,8 +18,10 @@ class TraceInfo(_MlflowObject):
         timestamp_ms: start time of the trace, in milliseconds.
         execution_time_ms: duration of the trace, in milliseconds.
         status: status of the trace.
-        request_metadata: request metadata associated with the trace.
-        tags: tags associated with the trace.
+        request_metadata: Key-value pairs associated with the trace. Request metadata are designed
+            for immutable values like run ID associated with the trace.
+        tags: Tags associated with the trace. Tags are designed for mutable values like trace name,
+            that can be updated by the users after the trace is created, unlike request_metadata.
     """
 
     request_id: str
@@ -27,8 +29,8 @@ class TraceInfo(_MlflowObject):
     timestamp_ms: int
     execution_time_ms: Optional[int]
     status: TraceStatus
-    request_metadata: Dict[str, str] = field(default_factory=dict)
-    tags: Dict[str, str] = field(default_factory=dict)
+    request_metadata: dict[str, str] = field(default_factory=dict)
+    tags: dict[str, str] = field(default_factory=dict)
 
     def __eq__(self, other):
         if type(other) is type(self):
@@ -42,7 +44,10 @@ class TraceInfo(_MlflowObject):
         proto.request_id = self.request_id
         proto.experiment_id = self.experiment_id
         proto.timestamp_ms = self.timestamp_ms
-        proto.execution_time_ms = self.execution_time_ms
+        # NB: Proto setter does not support nullable fields (even with 'optional' keyword),
+        # so we substitute None with 0 for execution_time_ms. This should be not too confusing
+        # as we only put None when starting a trace i.e. the execution time is actually 0.
+        proto.execution_time_ms = self.execution_time_ms or 0
         proto.status = self.status.to_proto()
 
         request_metadata = []
